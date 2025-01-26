@@ -4,9 +4,9 @@
 
 try:
     from sys import version_info
-    assert version_info >= (3, 7)
+    assert version_info >= (3, 8)
 except AssertionError:
-    exit("Piku requires Python 3.7 or above")
+    exit("Piku requires Python 3.8 or above")
 
 from importlib import import_module
 from collections import defaultdict, deque
@@ -31,10 +31,12 @@ from urllib.request import urlopen
 
 from click import argument, group, secho as echo, pass_context, CommandCollection
 
-# === Make sure we can access all system binaries ===
+# === Make sure we can access all system and user binaries ===
 
 if 'sbin' not in environ['PATH']:
     environ['PATH'] = "/usr/local/sbin:/usr/sbin:/sbin:" + environ['PATH']
+if '.local' not in environ['PATH']:
+    environ['PATH'] = environ['HOME'] + "/.local/bin:" + environ['PATH']
 
 # === Globals - all tweakable settings are here ===
 
@@ -107,7 +109,7 @@ $PIKU_INTERNAL_NGINX_COMMON
 """
 # pylint: enable=anomalous-backslash-in-string
 
-NGINX_COMMON_FRAGMENT = """
+NGINX_COMMON_FRAGMENT = r"""
   listen              $NGINX_IPV6_ADDRESS:$NGINX_SSL;
   listen              $NGINX_IPV4_ADDRESS:$NGINX_SSL;
   ssl_certificate     $NGINX_ROOT/$APP.crt;
@@ -171,7 +173,7 @@ PIKU_INTERNAL_NGINX_STATIC_MAPPING = """
       directio 8m;
       aio threads;
       alias $static_path;
-      try_files $uri $uri.html $uri/ =404;
+      try_files $uri $uri.html $uri/ $catch_all =404;
   }
 """
 
@@ -183,7 +185,7 @@ PIKU_INTERNAL_NGINX_CACHE_MAPPING = """
     location ~* ^/($cache_prefixes) {
         uwsgi_cache $APP;
         uwsgi_cache_min_uses 1;
-        uwsgi_cache_key $host$uri;
+        uwsgi_cache_key $host$request_uri;
         uwsgi_cache_valid 200 304 $cache_time_content;
         uwsgi_cache_valid 301 307 $cache_time_redirects;
         uwsgi_cache_valid 500 502 503 504 0s;
@@ -213,7 +215,7 @@ PIKU_INTERNAL_NGINX_UWSGI_SETTINGS = """
     uwsgi_param SERVER_NAME $server_name;
 """
 
-CRON_REGEXP = "^((?:(?:\*\/)?\d+)|\*) ((?:(?:\*\/)?\d+)|\*) ((?:(?:\*\/)?\d+)|\*) ((?:(?:\*\/)?\d+)|\*) ((?:(?:\*\/)?\d+)|\*) (.*)$"
+CRON_REGEXP = r"^((?:(?:\*\/)?\d+)|\*) ((?:(?:\*\/)?\d+)|\*) ((?:(?:\*\/)?\d+)|\*) ((?:(?:\*\/)?\d+)|\*) ((?:(?:\*\/)?\d+)|\*) (.*)$"
 
 # === Utility functions ===
 
@@ -288,7 +290,7 @@ def parse_procfile(filename):
             try:
                 kind, command = map(lambda x: x.strip(), line.split(":", 1))
                 # Check for cron patterns
-                if kind == "cron":
+                if kind.startswith("cron"):
                     limits = [59, 24, 31, 12, 7]
                     res = match(CRON_REGEXP, command)
                     if res:
@@ -394,6 +396,10 @@ def do_deploy(app, deltas={}, newrev=None):
                 workers.pop("preflight", None)
             if exists(join(app_path, 'requirements.txt')) and found_app("Python"):
                 settings.update(deploy_python(app, deltas))
+            elif exists(join(app_path, 'pyproject.toml')) and which('poetry') and found_app("Python"):
+                settings.update(deploy_python_with_poetry(app, deltas))
+            elif exists(join(app_path, 'pyproject.toml')) and which('uv') and found_app("Python (uv)"):
+                settings.update(deploy_python_with_uv(app, deltas))
             elif exists(join(app_path, 'Gemfile')) and found_app("Ruby Application") and check_requirements(['ruby', 'gem', 'bundle']):
                 settings.update(deploy_ruby(app, deltas))
             elif exists(join(app_path, 'package.json')) and found_app("Node") and (
@@ -403,12 +409,20 @@ def do_deploy(app, deltas={}, newrev=None):
                 settings.update(deploy_java_maven(app, deltas))
             elif exists(join(app_path, 'build.gradle')) and found_app("Java Gradle") and check_requirements(['java', 'gradle']):
                 settings.update(deploy_java_gradle(app, deltas))
-            elif (exists(join(app_path, 'Godeps')) or len(glob(join(app_path, '*.go')))) and found_app("Go") and check_requirements(['go']):
+            elif (exists(join(app_path, 'Godeps')) or exists(join(app_path, 'go.mod')) or len(glob(join(app_path, '*.go')))) and found_app("Go") and check_requirements(['go']):
                 settings.update(deploy_go(app, deltas))
             elif exists(join(app_path, 'deps.edn')) and found_app("Clojure CLI") and check_requirements(['java', 'clojure']):
                 settings.update(deploy_clojure_cli(app, deltas))
             elif exists(join(app_path, 'project.clj')) and found_app("Clojure Lein") and check_requirements(['java', 'lein']):
                 settings.update(deploy_clojure_leiningen(app, deltas))
+            elif 'php' in workers:
+                if check_requirements(['uwsgi_php']):
+                    echo("-----> PHP app detected.", fg='green')
+                    settings.update(deploy_identity(app, deltas))
+                else:
+                    echo("-----> PHP app detected but uwsgi-plugin-php was not found", fg='red')
+            elif exists(join(app_path, 'Cargo.toml')) and exists(join(app_path, 'rust-toolchain.toml')) and found_app("Rust") and check_requirements(['rustc', 'cargo']):
+                settings.update(deploy_rust(app, deltas))
             elif 'release' in workers and 'web' in workers:
                 echo("-----> Generic app detected.", fg='green')
                 settings.update(deploy_identity(app, deltas))
@@ -566,6 +580,7 @@ def deploy_go(app, deltas={}):
 
     go_path = join(ENV_ROOT, app)
     deps = join(APP_ROOT, app, 'Godeps')
+    go_mod = join(APP_ROOT, app, 'go.mod')
 
     first_time = False
     if not exists(go_path):
@@ -585,11 +600,25 @@ def deploy_go(app, deltas={}):
                 'GO15VENDOREXPERIMENT': '1'
             }
             call('godep update ...', cwd=join(APP_ROOT, app), env=env, shell=True)
+
+    if exists(go_mod):
+        echo("-----> Running go mod tidy for '{}'".format(app), fg='green')
+        call('go mod tidy', cwd=join(APP_ROOT, app), shell=True)
+
+    return spawn_app(app, deltas)
+
+
+def deploy_rust(app, deltas={}):
+    """Deploy a Rust application"""
+
+    app_path = join(APP_ROOT, app)
+    echo("-----> Running cargo build for '{}'".format(app), fg='green')
+    call('cargo build', cwd=app_path, shell=True)
     return spawn_app(app, deltas)
 
 
 def deploy_node(app, deltas={}):
-    """Deploy a Node  application"""
+    """Deploy a Node application"""
 
     virtualenv_path = join(ENV_ROOT, app)
     node_path = join(ENV_ROOT, app, "node_modules")
@@ -612,6 +641,9 @@ def deploy_node(app, deltas={}):
     }
     if exists(env_file):
         env.update(parse_settings(env_file, env))
+
+    package_manager_command = env.get("NODE_PACKAGE_MANAGER", "npm --package-lock=false")
+    package_manager = package_manager_command.split(" ")[0]
 
     # include node binaries on our path
     environ["PATH"] = env["PATH"]
@@ -638,8 +670,11 @@ def deploy_node(app, deltas={}):
             copyfile(join(APP_ROOT, app, 'package.json'), join(ENV_ROOT, app, 'package.json'))
             if not exists(node_modules_symlink):
                 symlink(node_path, node_modules_symlink)
-            echo("-----> Running npm for '{}'".format(app), fg='green')
-            call('npm install --prefix {} --package-lock=false'.format(npm_prefix), cwd=join(APP_ROOT, app), env=env, shell=True)
+            if package_manager != "npm":
+                echo("-----> Installing package manager {} with npm".format(package_manager))
+                call("npm install -g {}".format(package_manager), cwd=join(APP_ROOT, app), env=env, shell=True)
+            echo("-----> Running {} for '{}'".format(package_manager_command, app), fg='green')
+            call('{} install --prefix {}'.format(package_manager_command, npm_prefix), cwd=join(APP_ROOT, app), env=env, shell=True)
     return spawn_app(app, deltas)
 
 
@@ -680,6 +715,65 @@ def deploy_python(app, deltas={}):
     return spawn_app(app, deltas)
 
 
+def deploy_python_with_poetry(app, deltas={}):
+    """Deploy a Python application using Poetry"""
+
+    echo("=====> Starting EXPERIMENTAL poetry deployment for '{}'".format(app), fg='red')
+    virtualenv_path = join(ENV_ROOT, app)
+    requirements = join(APP_ROOT, app, 'pyproject.toml')
+    env_file = join(APP_ROOT, app, 'ENV')
+    symlink_path = join(APP_ROOT, app, '.venv')
+    if not exists(symlink_path):
+        echo("-----> Creating .venv symlink '{}'".format(app), fg='green')
+        symlink(virtualenv_path, symlink_path, target_is_directory=True)
+    # Set unbuffered output and readable UTF-8 mapping
+    env = {
+        **environ,
+        'POETRY_VIRTUALENVS_IN_PROJECT': '1',
+        'PYTHONUNBUFFERED': '1',
+        'PYTHONIOENCODING': 'UTF_8:replace'
+    }
+    if exists(env_file):
+        env.update(parse_settings(env_file, env))
+
+    first_time = False
+    if not exists(join(virtualenv_path, "bin", "activate")):
+        echo("-----> Creating virtualenv for '{}'".format(app), fg='green')
+        try:
+            makedirs(virtualenv_path)
+        except FileExistsError:
+            echo("-----> Env dir already exists: '{}'".format(app), fg='yellow')
+        first_time = True
+
+    if first_time or getmtime(requirements) > getmtime(virtualenv_path):
+        echo("-----> Running poetry for '{}'".format(app), fg='green')
+        call('poetry install', cwd=join(APP_ROOT, app), env=env, shell=True)
+
+    return spawn_app(app, deltas)
+
+
+def deploy_python_with_uv(app, deltas={}):
+    """Deploy a Python application using Astral uv"""
+
+    echo("=====> Starting EXPERIMENTAL uv deployment for '{}'".format(app), fg='red')
+    env_file = join(APP_ROOT, app, 'ENV')
+    virtualenv_path = join(ENV_ROOT, app)
+    # Set unbuffered output and readable UTF-8 mapping
+    env = {
+        **environ,
+        'PYTHONUNBUFFERED': '1',
+        'PYTHONIOENCODING': 'UTF_8:replace',
+        'UV_PROJECT_ENVIRONMENT': virtualenv_path
+    }
+    if exists(env_file):
+        env.update(parse_settings(env_file, env))
+
+    echo("-----> Calling uv sync", fg='green')
+    call('uv sync --python-preference only-system', cwd=join(APP_ROOT, app), env=env, shell=True)
+
+    return spawn_app(app, deltas)
+
+
 def deploy_identity(app, deltas={}):
     env_path = join(ENV_ROOT, app)
     if not exists(env_path):
@@ -714,6 +808,7 @@ def spawn_app(app, deltas={}):
     env = {
         'APP': app,
         'LOG_ROOT': LOG_ROOT,
+        'DATA_ROOT': join(DATA_ROOT, app),
         'HOME': environ['HOME'],
         'USER': environ['USER'],
         'PATH': ':'.join([join(virtualenv_path, 'bin'), environ['PATH']]),
@@ -741,7 +836,7 @@ def spawn_app(app, deltas={}):
     if exists(settings):
         env.update(parse_settings(settings, env))  # lgtm [py/modification-of-default-value]
 
-    if 'web' in workers or 'wsgi' in workers or 'jwsgi' in workers or 'static' in workers or 'rwsgi' in workers:
+    if 'web' in workers or 'wsgi' in workers or 'jwsgi' in workers or 'static' in workers or 'rwsgi' in workers or 'php' in workers:
         # Pick a port if none defined
         if 'PORT' not in env:
             env['PORT'] = str(get_free_port())
@@ -849,7 +944,7 @@ def spawn_app(app, deltas={}):
 
             env['NGINX_ACL'] = " ".join(acl)
 
-            env['PIKU_INTERNAL_NGINX_BLOCK_GIT'] = "" if env.get('NGINX_ALLOW_GIT_FOLDERS') else "location ~ /\.git { deny all; }"
+            env['PIKU_INTERNAL_NGINX_BLOCK_GIT'] = "" if env.get('NGINX_ALLOW_GIT_FOLDERS') else r"location ~ /\.git { deny all; }"
 
             env['PIKU_INTERNAL_PROXY_CACHE_PATH'] = ''
             env['PIKU_INTERNAL_NGINX_CACHE_MAPPINGS'] = ''
@@ -934,6 +1029,8 @@ def spawn_app(app, deltas={}):
                 static_paths = ("/" if stripped[0:1] == ":" else "/:") + (stripped if stripped else ".") + "/" + ("," if static_paths else "") + static_paths
             if len(static_paths):
                 try:
+                    # pylint: disable=unused-variable
+                    catch_all = env.get('NGINX_CATCH_ALL', '')
                     items = static_paths.split(',')
                     for item in items:
                         static_url, static_path = item.split(':')
@@ -948,7 +1045,7 @@ def spawn_app(app, deltas={}):
 
             env['PIKU_INTERNAL_NGINX_CUSTOM_CLAUSES'] = expandvars(open(join(app_path, env["NGINX_INCLUDE_FILE"])).read(), env) if env.get("NGINX_INCLUDE_FILE") else ""
             env['PIKU_INTERNAL_NGINX_PORTMAP'] = ""
-            if 'web' in workers or 'wsgi' in workers or 'jwsgi' in workers or 'rwsgi' in workers:
+            if 'web' in workers or 'wsgi' in workers or 'jwsgi' in workers or 'rwsgi' in workers or 'php' in workers:
                 env['PIKU_INTERNAL_NGINX_PORTMAP'] = expandvars(NGINX_PORTMAP_FRAGMENT, env)
             env['PIKU_INTERNAL_NGINX_COMMON'] = expandvars(NGINX_COMMON_FRAGMENT, env)
 
@@ -974,7 +1071,7 @@ def spawn_app(app, deltas={}):
                 h.write(buffer)
             # prevent broken config from breaking other deploys
             try:
-                nginx_config_test = str(check_output("nginx -t 2>&1 | grep {}".format(app), env=environ, shell=True))
+                nginx_config_test = str(check_output(r"nginx -t 2>&1 | grep -E '{}\.conf:[0-9]+$'".format(app), env=environ, shell=True))
             except Exception:
                 nginx_config_test = None
             if nginx_config_test:
@@ -1077,7 +1174,7 @@ def spawn_worker(app, kind, command, env, ordinal=1):
             echo("Error: malformed setting 'UWSGI_IDLE', ignoring it.".format(), fg='red')
             pass
 
-    if kind == 'cron':
+    if kind.startswith("cron"):
         settings.extend([
             ['cron', command.replace("*/", "-").replace("*", "-1")],
         ])
@@ -1158,12 +1255,25 @@ def spawn_worker(app, kind, command, env, ordinal=1):
                 ('http-use-socket', '{BIND_ADDRESS:s}:{PORT:s}'.format(**env)),
                 ('http-socket', '{BIND_ADDRESS:s}:{PORT:s}'.format(**env)),
             ])
+    elif kind == 'php':
+        docroot = join(APP_ROOT, app, command.strip("/").rstrip("/"))
+        settings.extend([
+            ('plugin', 'http,0:php'),
+            ('http', ':{}'.format(env['PORT'])),
+            ('check-static', docroot),
+            ('static-skip-ext', '.php'),
+            ('static-skip-ext', '.inc'),
+            ('static-index', 'index.html'),
+            ('php-docroot', docroot),
+            ('php-allowed-ext', '.php'),
+            ('php-index', 'index.php')
+        ])
     elif kind == 'web':
         echo("-----> nginx will talk to the 'web' process via {BIND_ADDRESS:s}:{PORT:s}".format(**env), fg='yellow')
         settings.append(('attach-daemon', command))
     elif kind == 'static':
         echo("-----> nginx serving static files only".format(**env), fg='yellow')
-    elif kind == 'cron':
+    elif kind.startswith("cron"):
         echo("-----> uwsgi scheduled cron for {command}".format(**locals()), fg='yellow')
     else:
         settings.append(('attach-daemon', command))

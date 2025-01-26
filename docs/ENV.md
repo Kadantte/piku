@@ -13,6 +13,7 @@ You can configure deployment settings by placing special variables in an `ENV` f
 ### Node
 
 * `NODE_VERSION`: installs a particular version of node for your app if `nodeenv` is found on the path. Optional; if not specified, the system-wide node  package is used.
+* `NODE_PACKAGE_MANAGER`: use an alternate package manager (e.g. set to `yarn` or `pnpm`). The package manager will be installed with `npm install -g`.
 
 > **NOTE**: you will need to stop and re-deploy the app to change the `node` version in a running app.
 
@@ -71,6 +72,8 @@ Also, keep in mind that using `nginx` caching with a `static` website worker wil
 
 * `NGINX_INCLUDE_FILE`: a file in the app's dir to include in nginx config `server` section - useful for including custom `nginx` directives.
 * `NGINX_ALLOW_GIT_FOLDERS`: (boolean) allow access to `.git` folders (default: false, blocked)
+* `NGINX_CATCH_ALL` (string, defaults to ""): specifies a filename to serve to all requests regardless of path (useful when using client-side routing)
+
 
 ## Acme Settings
 

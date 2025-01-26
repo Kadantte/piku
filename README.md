@@ -24,7 +24,7 @@ There are also [other installation methods](https://piku.github.io/install) avai
 
 **`piku` is considered STABLE**. It is actively maintained, but "actively" here means the feature set is pretty much done, so it is only updated when new language runtimes are added or reproducible bugs crop up.
 
-It currently requires Python 3.7 or above, since even though 3.8+ is now the baseline Python 3 version in Ubuntu LTS 20.04 and Debian 11 has already moved on to 3.9, there are no substantial differences between those versions.
+It currently requires Python 3.8 or above (which is what we test against), although it can be cajoled to run on older versions. We currently aim to support the latest two Debian and Ubuntu LTS major versions.
 
 ## Motivation
 
@@ -70,7 +70,7 @@ These features are configured by setting appropriate values in the [`ENV`](https
 
 `piku` is intended to work in any POSIX-like environment where you have Python, `nginx`, `uwsgi` and SSH: it has been deployed on Linux, FreeBSD, [Cygwin][cygwin] and the [Windows Subsystem for Linux][wsl].
 
-As a baseline, it began its development on an original 256MB Rasbperry Pi Model B, and still runs reliably on it.
+As a baseline, it began its development on an original 256MB Raspberry Pi Model B, and still runs reliably on it.
 
 But its main use is as a micro-PaaS to run applications on cloud servers with both Intel and ARM CPUs, with Debian and Ubuntu Linux as target platforms.
 
